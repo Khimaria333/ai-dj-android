@@ -23,6 +23,17 @@ object ExternalMediaController {
         val controller = findYoutubeMusicController(context)
             ?: return Result(false, "none", 0L, "YouTube Music aktif MediaSession bulunamadı")
 
+        // First prefer an exact item already present in YouTube Music's own active queue.
+        findQueueItemId(controller, title, artist)?.let { queueId ->
+            return try {
+                controller.transportControls.skipToQueueItem(queueId)
+                Result(true, "skipToQueueItem", controller.playbackState?.actions ?: 0L, "Hedef parça YouTube Music kuyruğunda bulundu")
+            } catch (_: Throwable) {
+                // Continue to search command below.
+                Result(false, "skipToQueueItem", controller.playbackState?.actions ?: 0L, "Kuyruk öğesi açılamadı")
+            }
+        }?.takeIf { it.sent }?.let { return it }
+
         val query = listOf(title.trim(), artist.trim()).filter { it.isNotBlank() }.joinToString(" ")
         if (query.isBlank()) return Result(false, "none", controller.playbackState?.actions ?: 0L, "Arama metni boş")
 
@@ -39,8 +50,16 @@ object ExternalMediaController {
         if (videoId.isBlank()) return Result(false, "none", 0L, "YouTube video kimliği boş")
         val controller = findYoutubeMusicController(context)
         val actions = controller?.playbackState?.actions ?: 0L
-        val uri = Uri.parse("https://music.youtube.com/watch?v=$videoId&t=0")
 
+        if (controller != null && actions and PlaybackState.ACTION_PLAY_FROM_MEDIA_ID != 0L) {
+            try {
+                controller.transportControls.playFromMediaId(videoId, Bundle.EMPTY)
+                return Result(true, "playFromMediaId", actions, "YouTube video kimliği MediaSession'a gönderildi")
+            } catch (_: Throwable) {
+            }
+        }
+
+        val uri = Uri.parse("https://music.youtube.com/watch?v=$videoId&t=0")
         if (controller != null && actions and PlaybackState.ACTION_PLAY_FROM_URI != 0L) {
             return try {
                 controller.transportControls.playFromUri(uri, Bundle.EMPTY)
@@ -80,6 +99,21 @@ object ExternalMediaController {
         val actions = findYoutubeMusicController(context)?.playbackState?.actions ?: return false
         return actions and PlaybackState.ACTION_PLAY_FROM_SEARCH != 0L
     }
+
+    private fun findQueueItemId(controller: MediaController, title: String, artist: String): Long? {
+        val wantedTitle = normalize(title)
+        val wantedArtist = normalize(artist)
+        if (wantedTitle.isBlank()) return null
+        return controller.queue.orEmpty().firstOrNull { item ->
+            val qTitle = normalize(item.description.title?.toString().orEmpty())
+            val qArtist = normalize(item.description.subtitle?.toString().orEmpty())
+            qTitle == wantedTitle && (wantedArtist.isBlank() || qArtist.contains(wantedArtist) || wantedArtist.contains(qArtist))
+        }?.queueId
+    }
+
+    private fun normalize(raw: String): String = raw.lowercase()
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .trim()
 
     private fun findYoutubeMusicController(context: Context): MediaController? {
         val manager = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
