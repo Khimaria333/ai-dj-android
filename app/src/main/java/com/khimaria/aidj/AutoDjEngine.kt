@@ -33,6 +33,11 @@ data class RankedRecommendation(
 object AutoDjEngine {
     const val SESSION_GAP_MS = 60L * 60L * 1000L
 
+    @Volatile var pendingForTrackKey: String? = null
+        private set
+    @Volatile var pendingRecommendation: RankedRecommendation? = null
+        private set
+
     fun rank(
         current: Track?,
         candidates: List<Track>,
@@ -55,10 +60,14 @@ object AutoDjEngine {
         val seed = seedTags.map { normalizeTag(it) }.filter { it.isNotBlank() }.toSet()
         val explicitAvoid = avoid - (history.map { it.key }.toSet() - sessionKeys)
 
-        return candidates.distinctBy { it.key }
+        val ranked = candidates.distinctBy { it.key }
             .filter { it.title.isNotBlank() && it.key != current?.key && it.key !in sessionKeys && it.key !in explicitAvoid && it.key !in disliked }
             .map { track -> scoreTrack(track, current, sessionHistory, recentArtists, liked, likedArtists, dislikedArtists, seed, mode, skipCounts, listenedCounts, history) }
             .sortedWith(compareByDescending<RankedRecommendation> { it.score }.thenByDescending { it.confidence }.thenBy { it.track.key })
+
+        pendingForTrackKey = current?.key
+        pendingRecommendation = ranked.firstOrNull()
+        return ranked
     }
 
     private fun removeRestoreBurst(rows: List<Track>): List<Track> {
@@ -81,9 +90,6 @@ object AutoDjEngine {
         val sameArtist = artistKey.isNotBlank() && artistKey == currentArtist
         val seenBefore = history.any { it.key == track.key }
 
-        // A direct catalog search for the currently-playing artist is NOT evidence that the song is
-        // musically compatible. Same-artist tracks must win through tags, taste, metadata and flow,
-        // while ListenBrainz related-artist radio remains a strong similarity signal.
         val relation = when {
             track.source.startsWith("artist:easy") -> 94.0
             track.source.startsWith("artist:medium") -> 84.0
@@ -120,7 +126,6 @@ object AutoDjEngine {
         var sessionFit = 78.0
         val repeats = recentArtists.count { it == artistKey && artistKey.isNotBlank() }
         if (repeats > 0) sessionFit -= (repeats * 7).coerceAtMost(21)
-        // Same artist remains legal, but needs stronger evidence than just being in that artist's catalog.
         if (sameArtist) {
             sessionFit -= 14
             reasons += "aynı sanatçı: güçlü uyum gerekli"
