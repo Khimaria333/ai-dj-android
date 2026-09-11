@@ -6,9 +6,16 @@ import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 
 object RecommendationClient {
-    private const val USER_AGENT = "AI-DJ-Android/0.7 (https://github.com/Khimaria333/ai-dj-android)"
+    private const val USER_AGENT = "AI-DJ-Android/0.7.1 (https://github.com/Khimaria333/ai-dj-android)"
+    private const val MUSICBRAINZ_MIN_INTERVAL_MS = 1150L
+    private const val CACHE_TTL_MS = 30L * 60L * 1000L
+
+    private val cache = ConcurrentHashMap<String, Pair<Long, JSONObject>>()
+    private val musicBrainzLock = Any()
+    @Volatile private var lastMusicBrainzRequestAt = 0L
 
     data class DiscoveryResult(
         val candidates: List<Track>,
@@ -20,14 +27,22 @@ object RecommendationClient {
         if (current.artist.isBlank()) return DiscoveryResult(emptyList(), emptySet(), listOf("artist_missing"))
 
         val status = mutableListOf<String>()
+        val collected = linkedMapOf<String, Track>()
+
+        // First try to resolve the artist. MusicBrainz is rate-limited to ~1 req/s, so every
+        // MusicBrainz request is throttled and cached in getJson().
         val artist = runCatching { findArtist(current.artist) }.getOrNull()
         if (artist == null) {
-            val fallback = runCatching { searchRecordingsByArtist(current.artist, 30) }.getOrDefault(emptyList())
-            return DiscoveryResult(fallback, emptySet(), listOf("artist_lookup_failed", "catalog_fallback"))
+            status += "artist_lookup_failed"
+            runCatching { searchRecordingsByArtist(current.artist, 45) }
+                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "catalog_fallback:${rows.size}" }
+                .onFailure { status += "catalog_fallback_failed" }
+            return DiscoveryResult(collected.values.take(140), emptySet(), status)
         }
 
-        val seedTags = runCatching { fetchArtistTags(artist.first) }.getOrDefault(emptySet())
-        val collected = linkedMapOf<String, Track>()
+        val seedTags = runCatching { fetchArtistTags(artist.first) }
+            .onFailure { status += "tags_failed" }
+            .getOrDefault(emptySet())
 
         runCatching { fetchArtistRadio(artist.first, "easy", 16, 5) }
             .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "artist_easy:${rows.size}" }
@@ -46,18 +61,31 @@ object RecommendationClient {
                 .onFailure { status += "tag_${tag}_failed" }
         }
 
-        if (collected.size < 35) {
-            val rows = runCatching { searchRecordingsByArtist(artist.second, 35) }.getOrDefault(emptyList())
-            rows.forEach { collected.putIfAbsent(it.key, it) }
-            status += "artist_catalog:${rows.size}"
+        // Always add a catalog floor. This stops an otherwise good artist match from producing
+        // zero candidates when ListenBrainz radio has a temporary empty response.
+        if (collected.size < 50) {
+            runCatching { searchRecordingsByArtist(artist.second, 50) }
+                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "artist_catalog:${rows.size}" }
+                .onFailure { status += "artist_catalog_failed" }
         }
 
-        if (collected.size < 45) {
+        if (collected.size < 55) {
             seedTags.take(2).forEach { tag ->
-                val rows = runCatching { searchRecordingsByTag(tag, 25) }.getOrDefault(emptyList())
-                rows.forEach { collected.putIfAbsent(it.key, it.copy(tags = it.tags + tag.lowercase())) }
-                status += "tag_catalog_${tag}:${rows.size}"
+                runCatching { searchRecordingsByTag(tag, 30) }
+                    .onSuccess { rows ->
+                        rows.forEach { collected.putIfAbsent(it.key, it.copy(tags = it.tags + tag.lowercase())) }
+                        status += "tag_catalog_${tag}:${rows.size}"
+                    }
+                    .onFailure { status += "tag_catalog_${tag}_failed" }
             }
+        }
+
+        // Final broad fallback: retry the artist catalog with a looser query if every specialized
+        // source failed. This is deliberately current-artist scoped, not old-session history.
+        if (collected.isEmpty()) {
+            runCatching { searchRecordingsLoose(current.artist, 60) }
+                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "loose_catalog:${rows.size}" }
+                .onFailure { status += "loose_catalog_failed" }
         }
 
         return DiscoveryResult(collected.values.take(140), seedTags, status)
@@ -127,6 +155,12 @@ object RecommendationClient {
         val q = URLEncoder.encode("artist:\"$artist\"", StandardCharsets.UTF_8.toString())
         val root = getJson("https://musicbrainz.org/ws/2/recording/?query=$q&fmt=json&limit=$limit")
         return parseRecordingSearch(root, "musicbrainz:artist")
+    }
+
+    private fun searchRecordingsLoose(artist: String, limit: Int): List<Track> {
+        val q = URLEncoder.encode(artist, StandardCharsets.UTF_8.toString())
+        val root = getJson("https://musicbrainz.org/ws/2/recording/?query=$q&fmt=json&limit=$limit")
+        return parseRecordingSearch(root, "musicbrainz:loose")
     }
 
     private fun searchRecordingsByTag(tag: String, limit: Int): List<Track> {
@@ -199,13 +233,50 @@ object RecommendationClient {
     }
 
     private fun getJson(url: String): JSONObject {
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 8500
-        conn.readTimeout = 8500
-        conn.setRequestProperty("User-Agent", USER_AGENT)
-        conn.setRequestProperty("Accept", "application/json")
-        val code = conn.responseCode
-        if (code !in 200..299) throw IllegalStateException("HTTP $code")
-        return conn.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+        val now = System.currentTimeMillis()
+        cache[url]?.let { (savedAt, value) ->
+            if (now - savedAt <= CACHE_TTL_MS) return JSONObject(value.toString())
+            cache.remove(url)
+        }
+
+        val isMusicBrainz = url.contains("musicbrainz.org")
+        var lastError: Throwable? = null
+
+        repeat(3) { attempt ->
+            try {
+                if (isMusicBrainz) throttleMusicBrainz()
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.connectTimeout = 9000
+                conn.readTimeout = 9000
+                conn.setRequestProperty("User-Agent", USER_AGENT)
+                conn.setRequestProperty("Accept", "application/json")
+                val code = conn.responseCode
+                if (code in 200..299) {
+                    val json = conn.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+                    cache[url] = System.currentTimeMillis() to JSONObject(json.toString())
+                    return json
+                }
+                if (code == 429 || code == 503 || code == 502 || code == 504) {
+                    val retryAfter = conn.getHeaderField("Retry-After")?.toLongOrNull()?.times(1000L)
+                    Thread.sleep(retryAfter ?: (900L * (attempt + 1)))
+                    lastError = IllegalStateException("HTTP $code")
+                } else {
+                    throw IllegalStateException("HTTP $code")
+                }
+            } catch (t: Throwable) {
+                lastError = t
+                if (attempt < 2) Thread.sleep(650L * (attempt + 1))
+            }
+        }
+        throw lastError ?: IllegalStateException("Request failed")
+    }
+
+    private fun throttleMusicBrainz() {
+        synchronized(musicBrainzLock) {
+            val now = System.currentTimeMillis()
+            val wait = MUSICBRAINZ_MIN_INTERVAL_MS - (now - lastMusicBrainzRequestAt)
+            if (wait > 0) Thread.sleep(wait)
+            lastMusicBrainzRequestAt = System.currentTimeMillis()
+        }
     }
 }
