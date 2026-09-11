@@ -7,7 +7,8 @@ data class Track(
     val recordingMbid: String = "",
     val artistMbid: String = "",
     val tags: Set<String> = emptySet(),
-    val popularity: Int? = null
+    val popularity: Int? = null,
+    val observedAtMs: Long = System.currentTimeMillis()
 ) {
     val key: String get() = "${title.lowercase()}|${artist.lowercase()}"
     val display: String get() = if (artist.isBlank()) title else "$title — $artist"
@@ -22,6 +23,10 @@ data class RankedRecommendation(
 )
 
 object AutoDjEngine {
+    // The current listening context is intentionally short-lived. Long-term taste remains
+    // available through likes/listen/skip counters, but old sessions must not steer today's flow.
+    private const val SESSION_GAP_MS = 60L * 60L * 1000L
+
     fun rank(
         current: Track?,
         candidates: List<Track>,
@@ -34,8 +39,20 @@ object AutoDjEngine {
         skipCounts: Map<String, Int> = emptyMap(),
         listenedCounts: Map<String, Int> = emptyMap()
     ): List<RankedRecommendation> {
-        val recentTracks = history.take(8).map { it.key }.toSet() + avoid
-        val recentArtists = history.take(5).map { it.artist.lowercase() }.filter { it.isNotBlank() }
+        val now = System.currentTimeMillis()
+        val sessionCutoff = now - SESSION_GAP_MS
+        val sessionHistory = history.filter { it.observedAtMs > 0L && it.observedAtMs >= sessionCutoff }
+
+        // MainActivity used to put the last global-history entries into avoid. Strip those old
+        // entries here so another listening session cannot accidentally become today's context.
+        val historyKeys = history.map { it.key }.toSet()
+        val explicitAvoid = avoid.filterTo(mutableSetOf()) { key ->
+            key !in historyKeys || sessionHistory.any { it.key == key }
+        }
+        val recentTracks = sessionHistory.take(8).map { it.key }.toSet() + explicitAvoid
+        val recentArtists = sessionHistory.take(5).map { it.artist.lowercase() }.filter { it.isNotBlank() }
+
+        // These are long-term taste signals. They influence preference, not the current-session flow.
         val likedArtists = history.filter { it.key in liked }.map { it.artist.lowercase() }.toSet()
         val dislikedArtists = history.filter { it.key in disliked }.map { it.artist.lowercase() }.toSet()
         val seed = seedTags.map { it.lowercase() }.toSet()
@@ -65,7 +82,8 @@ object AutoDjEngine {
                     }
                     reasons += "yeni keşif"
                 } else {
-                    score -= 10 + (8 - seenIndex.coerceAtMost(8))
+                    // Old listening is not a flow blocker; it only gives a small familiarity cost.
+                    score -= 5
                     reasons += "daha önce dinlendi"
                 }
 
@@ -81,10 +99,15 @@ object AutoDjEngine {
                 val listens = listenedCounts[track.key] ?: 0
                 if (listens > 0) score += (listens * 5).coerceAtMost(15)
 
+                // Same artist is allowed. It receives only a gentle diversity nudge so a genuinely
+                // stronger musical match can still win instead of being rejected by artist name.
                 if (artistKey.isNotBlank()) {
                     val repeats = recentArtists.count { it == artistKey }
-                    score -= repeats * 26
-                    if (current != null && artistKey == current.artist.lowercase()) score -= 20
+                    if (repeats > 0) score -= (repeats * 5).coerceAtMost(12)
+                    if (current != null && artistKey == current.artist.lowercase()) score -= 7
+                    if (repeats > 0 || (current != null && artistKey == current.artist.lowercase())) {
+                        reasons += "hafif çeşitlilik dengesi"
+                    }
                 }
 
                 val overlap = track.tags.map { it.lowercase() }.toSet().intersect(seed)
