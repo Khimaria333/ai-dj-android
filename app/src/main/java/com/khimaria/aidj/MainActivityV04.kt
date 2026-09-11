@@ -1,17 +1,13 @@
 package com.khimaria.aidj
 
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Color
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -25,31 +21,17 @@ class MainActivityV04 : AppCompatActivity() {
     private lateinit var recommendation: TextView
     private lateinit var historyText: TextView
     private lateinit var autoButton: Button
+    private lateinit var trackInput: EditText
+    private lateinit var artistInput: EditText
     private var autoMode = false
     private var current: Track? = null
     private var history = mutableListOf<Track>()
     private val liked = mutableSetOf<String>()
     private val disliked = mutableSetOf<String>()
 
-    private val receiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            val title = intent?.getStringExtra(NowPlayingListenerService.EXTRA_TITLE).orEmpty()
-            val artist = intent?.getStringExtra(NowPlayingListenerService.EXTRA_ARTIST).orEmpty()
-            val source = intent?.getStringExtra(NowPlayingListenerService.EXTRA_PACKAGE).orEmpty()
-            if (title.isBlank()) return
-            val track = Track(title, artist, source)
-            if (track.key == current?.key) return
-            current = track
-            history.add(0, track)
-            history = history.distinctBy { it.key }.take(50).toMutableList()
-            nowPlaying.text = "Şimdi çalıyor\n${track.display}"
-            refreshRecommendation()
-            refreshHistory()
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         val scroll = ScrollView(this).apply { setBackgroundColor(Color.rgb(8,10,15)) }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -65,6 +47,15 @@ class MainActivityV04 : AppCompatActivity() {
             gravity = Gravity.CENTER
             setPadding(0, 10, 0, 10)
         }
+
+        fun input(hintText: String) = EditText(this).apply {
+            hint = hintText
+            setHintTextColor(Color.GRAY)
+            setTextColor(Color.WHITE)
+            setSingleLine(true)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+
         fun button(text: String, onClick: () -> Unit) = Button(this).apply {
             this.text = text
             setOnClickListener { onClick() }
@@ -72,11 +63,18 @@ class MainActivityV04 : AppCompatActivity() {
         }
 
         root.addView(label("AI DJ", 38f))
-        root.addView(label("v0.4 • Auto DJ çekirdeği", 16f, Color.CYAN))
-        root.addView(label("YouTube Music'te çalan parçayı takip eder, dinleme geçmişinden öğrenir ve tekrarları azaltarak bir sonraki parça önerisini seçer.", 14f, Color.LTGRAY))
+        root.addView(label("v0.4.1 • Güvenli Auto DJ", 16f, Color.CYAN))
+        root.addView(label("Bildirim erişimi kaldırıldı. Şarkıyı elle ekleyebilir veya YouTube Music'ten Paylaş → AI DJ ile gönderebilirsin. Auto DJ geçmişinden öğrenmeye devam eder.", 14f, Color.LTGRAY))
 
-        root.addView(button("1 • BİLDİRİM ERİŞİMİNİ AÇ") {
-            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        trackInput = input("Şarkı adı")
+        artistInput = input("Sanatçı")
+        root.addView(trackInput)
+        root.addView(artistInput)
+
+        root.addView(button("ŞİMDİ ÇALAN OLARAK EKLE") {
+            val title = trackInput.text.toString().trim()
+            val artist = artistInput.text.toString().trim()
+            if (title.isBlank()) toast("Şarkı adını yaz") else addTrack(Track(title, artist, "manual"))
         })
 
         nowPlaying = label("Şimdi çalıyor\nHenüz veri yok", 18f)
@@ -117,20 +115,46 @@ class MainActivityV04 : AppCompatActivity() {
         historyText = label("Dinleme geçmişi\n—", 14f, Color.LTGRAY)
         root.addView(historyText)
 
-        root.addView(label("Önemli: YouTube Music'in herkese açık resmi API'si üçüncü taraf uygulamaların gerçek oynatma kuyruğuna seçtiği parçayı otomatik eklemesine izin vermiyor. Bu sürüm gerçek çalan parçayı takip eder ve seçim motorunu geliştirir; tam otomatik 'seç ve sıraya koy' için yayınlanabilir, resmi queue erişimi sağlayan bir müzik kaynağı gerekir.", 12.5f, Color.GRAY))
+        root.addView(label("Bu sürüm hassas bildirim erişimi istemez. YouTube Music'in resmi API'si canlı oynatma kuyruğunu üçüncü taraf uygulamaya açmadığı için tam otomatik sıraya ekleme hâlâ mümkün değil; ancak seçim motoru, geçmiş ve tercih öğrenmesi korunuyor.", 12.5f, Color.GRAY))
 
         setContentView(scroll)
+        handleSharedText(intent)
     }
 
-    override fun onStart() {
-        super.onStart()
-        val filter = IntentFilter(NowPlayingListenerService.ACTION_NOW_PLAYING)
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED) else registerReceiver(receiver, filter)
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSharedText(intent)
     }
 
-    override fun onStop() {
-        runCatching { unregisterReceiver(receiver) }
-        super.onStop()
+    private fun handleSharedText(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND || intent.type != "text/plain") return
+        val shared = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty().trim()
+        if (shared.isBlank()) return
+
+        val firstLine = shared.lineSequence().firstOrNull().orEmpty().trim()
+        val cleaned = firstLine
+            .replace("https://music.youtube.com/", "")
+            .replace("https://youtu.be/", "")
+            .trim()
+
+        val title = when {
+            intent.getStringExtra(Intent.EXTRA_SUBJECT).orEmpty().isNotBlank() -> intent.getStringExtra(Intent.EXTRA_SUBJECT).orEmpty().trim()
+            cleaned.isNotBlank() && !cleaned.startsWith("http") -> cleaned
+            else -> "YouTube Music paylaşımı"
+        }
+        addTrack(Track(title, "", "youtube_share"))
+        toast("Paylaşılan parça AI DJ geçmişine eklendi")
+    }
+
+    private fun addTrack(track: Track) {
+        if (track.key == current?.key) return
+        current = track
+        history.add(0, track)
+        history = history.distinctBy { it.key }.take(50).toMutableList()
+        nowPlaying.text = "Şimdi çalıyor\n${track.display}"
+        refreshRecommendation()
+        refreshHistory()
     }
 
     private fun refreshRecommendation() {
@@ -139,11 +163,11 @@ class MainActivityV04 : AppCompatActivity() {
             return
         }
         val rec = AutoDjEngine.recommend(current, history, liked, disliked)
-        recommendation.text = if (rec == null) "AI önerisi\nDaha fazla şarkı dinledikçe öğreniyorum" else "AI sıradaki öneri\n${rec.display}"
+        recommendation.text = if (rec == null) "AI önerisi\nDaha fazla şarkı ekledikçe öğreniyorum" else "AI sıradaki öneri\n${rec.display}"
     }
 
     private fun refreshHistory() {
-        historyText.text = "Son dinlenenler\n" + history.take(6).joinToString("\n") { "• ${it.display}" }
+        historyText.text = if (history.isEmpty()) "Son dinlenenler\n—" else "Son dinlenenler\n" + history.take(6).joinToString("\n") { "• ${it.display}" }
     }
 
     private fun openYoutubeMusic(query: String) {
