@@ -32,11 +32,14 @@ data class RankedRecommendation(
 
 object AutoDjEngine {
     const val SESSION_GAP_MS = 60L * 60L * 1000L
+    private const val RECENT_PICK_WINDOW = 18
 
     @Volatile var pendingForTrackKey: String? = null
         private set
     @Volatile var pendingRecommendation: RankedRecommendation? = null
         private set
+
+    private val recentPickKeys = ArrayDeque<String>()
 
     fun rank(
         current: Track?,
@@ -59,15 +62,31 @@ object AutoDjEngine {
         val dislikedArtists = history.filter { it.key in disliked }.map { it.artist.lowercase() }.toSet()
         val seed = seedTags.map { normalizeTag(it) }.filter { it.isNotBlank() }.toSet()
         val explicitAvoid = avoid - (history.map { it.key }.toSet() - sessionKeys)
+        val recentSuggestions = synchronized(recentPickKeys) { recentPickKeys.toSet() }
 
-        val ranked = candidates.distinctBy { it.key }
+        val base = candidates.distinctBy { it.key }
             .filter { it.title.isNotBlank() && it.key != current?.key && it.key !in sessionKeys && it.key !in explicitAvoid && it.key !in disliked }
+
+        // Do not keep resurfacing the same globally strong candidate on every new song.
+        // Only relax this guard if the available pool is genuinely exhausted.
+        val rotated = base.filter { it.key !in recentSuggestions }.ifEmpty { base }
+
+        val ranked = rotated
             .map { track -> scoreTrack(track, current, sessionHistory, recentArtists, liked, likedArtists, dislikedArtists, seed, mode, skipCounts, listenedCounts, history) }
             .sortedWith(compareByDescending<RankedRecommendation> { it.score }.thenByDescending { it.confidence }.thenBy { it.track.key })
 
         pendingForTrackKey = current?.key
         pendingRecommendation = ranked.firstOrNull()
+        ranked.firstOrNull()?.track?.key?.let { rememberPick(it) }
         return ranked
+    }
+
+    private fun rememberPick(key: String) {
+        synchronized(recentPickKeys) {
+            recentPickKeys.remove(key)
+            recentPickKeys.addLast(key)
+            while (recentPickKeys.size > RECENT_PICK_WINDOW) recentPickKeys.removeFirst()
+        }
     }
 
     private fun removeRestoreBurst(rows: List<Track>): List<Track> {
