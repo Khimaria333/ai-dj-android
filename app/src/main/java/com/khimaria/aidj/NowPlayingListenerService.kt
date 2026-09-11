@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import kotlin.concurrent.thread
 
 class NowPlayingListenerService : NotificationListenerService() {
     private val controllers = mutableListOf<MediaController>()
@@ -171,7 +172,6 @@ class NowPlayingListenerService : NotificationListenerService() {
         val pick = AutoDjEngine.pendingRecommendation
         val pickFor = AutoDjEngine.pendingForTrackKey
         if (pick == null || pickFor != expectedKey) {
-            // Recommendation generation can finish slightly later on a slow network.
             val retry = Runnable { tryAutoHandoff(expectedKey) }
             handoffRunnable = retry
             handler.postDelayed(retry, 700L)
@@ -179,22 +179,41 @@ class NowPlayingListenerService : NotificationListenerService() {
         }
 
         val before = expectedKey
-        val result = ExternalMediaController.playYoutubeMusicSearch(this, pick.track.title, pick.track.artist)
+        val searchResult = ExternalMediaController.playYoutubeMusicSearch(this, pick.track.title, pick.track.artist)
+        recordHandoff(searchResult, pick.track)
+
+        handler.postDelayed({
+            if (normalizedKey(trackedTitle, trackedArtist) != before || trackedPackage != YOUTUBE_MUSIC) return@postDelayed
+
+            thread {
+                val videoId = YoutubeLinkResolver.resolveVideoId(pick.track.recordingMbid)
+                handler.post {
+                    if (normalizedKey(trackedTitle, trackedArtist) != before || trackedPackage != YOUTUBE_MUSIC) return@post
+                    if (!videoId.isNullOrBlank()) {
+                        val uriResult = ExternalMediaController.playYoutubeMusicVideo(this, videoId)
+                        recordHandoff(uriResult, pick.track)
+                        handler.postDelayed({
+                            if (normalizedKey(trackedTitle, trackedArtist) == before && trackedPackage == YOUTUBE_MUSIC) {
+                                val nextResult = ExternalMediaController.skipYoutubeMusicNext(this)
+                                recordHandoff(nextResult, pick.track)
+                            }
+                        }, 2_500L)
+                    } else {
+                        val nextResult = ExternalMediaController.skipYoutubeMusicNext(this)
+                        recordHandoff(nextResult, pick.track)
+                    }
+                }
+            }
+        }, 1_300L)
+    }
+
+    private fun recordHandoff(result: ExternalMediaController.Result, target: Track) {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString("last_handoff_method", result.method)
             .putString("last_handoff_message", result.message)
-            .putString("last_handoff_target", pick.track.display)
+            .putString("last_handoff_target", target.display)
             .putLong("last_handoff_at", System.currentTimeMillis())
             .apply()
-
-        // Some media apps expose the generic command but ignore playFromSearch. If the active
-        // track did not change after a short grace period, fall back to their own next-queue item
-        // instead of leaving playback stuck at the end.
-        handler.postDelayed({
-            if (normalizedKey(trackedTitle, trackedArtist) == before && trackedPackage == YOUTUBE_MUSIC) {
-                ExternalMediaController.skipYoutubeMusicNext(this)
-            }
-        }, 3_500L)
     }
 
     private fun cancelAutoHandoff() {
