@@ -9,7 +9,7 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 
 object RecommendationClient {
-    private const val USER_AGENT = "AI-DJ-Android/0.7.1 (https://github.com/Khimaria333/ai-dj-android)"
+    private const val USER_AGENT = "AI-DJ-Android/0.7.2 (https://github.com/Khimaria333/ai-dj-android)"
     private const val MUSICBRAINZ_MIN_INTERVAL_MS = 1150L
     private const val CACHE_TTL_MS = 30L * 60L * 1000L
 
@@ -28,31 +28,55 @@ object RecommendationClient {
 
         val status = mutableListOf<String>()
         val collected = linkedMapOf<String, Track>()
+        val seedTags = linkedSetOf<String>()
+        val seeds = splitArtistSeeds(current.artist)
+        status += "artist_seeds:${seeds.joinToString("+")}" 
 
-        // First try to resolve the artist. MusicBrainz is rate-limited to ~1 req/s, so every
-        // MusicBrainz request is throttled and cached in getJson().
-        val artist = runCatching { findArtist(current.artist) }.getOrNull()
-        if (artist == null) {
-            status += "artist_lookup_failed"
-            runCatching { searchRecordingsByArtist(current.artist, 45) }
-                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "catalog_fallback:${rows.size}" }
-                .onFailure { status += "catalog_fallback_failed" }
-            return DiscoveryResult(collected.values.take(140), emptySet(), status)
+        // Collaborative credits such as "Sufle ve Teoman", "A & B", "A feat. B" used to be
+        // searched as one literal artist and could collapse the pool to zero. Resolve each real
+        // artist independently and merge the results.
+        seeds.take(3).forEachIndexed { index, seedName ->
+            val artist = runCatching { findArtist(seedName) }.getOrNull()
+            if (artist == null) {
+                status += "seed_${index}_lookup_failed"
+                runCatching { searchRecordingsByArtist(seedName, 35) }
+                    .onSuccess { rows ->
+                        rows.forEach { collected.putIfAbsent(it.key, it) }
+                        status += "seed_${index}_catalog:${rows.size}"
+                    }
+                    .onFailure { status += "seed_${index}_catalog_failed" }
+                return@forEachIndexed
+            }
+
+            val tags = runCatching { fetchArtistTags(artist.first) }.getOrDefault(emptySet())
+            seedTags += tags
+
+            runCatching { fetchArtistRadio(artist.first, "easy", if (index == 0) 18 else 10, if (index == 0) 5 else 3) }
+                .onSuccess { rows ->
+                    rows.forEach { collected.putIfAbsent(it.key, it) }
+                    status += "seed_${index}_easy:${rows.size}"
+                }
+                .onFailure { status += "seed_${index}_easy_failed" }
+
+            runCatching { fetchArtistRadio(artist.first, "medium", if (index == 0) 24 else 12, if (index == 0) 4 else 2) }
+                .onSuccess { rows ->
+                    rows.forEach { collected.putIfAbsent(it.key, it) }
+                    status += "seed_${index}_medium:${rows.size}"
+                }
+                .onFailure { status += "seed_${index}_medium_failed" }
+
+            if (collected.size < 45) {
+                runCatching { searchRecordingsByArtist(artist.second, 40) }
+                    .onSuccess { rows ->
+                        rows.forEach { collected.putIfAbsent(it.key, it) }
+                        status += "seed_${index}_artist_catalog:${rows.size}"
+                    }
+                    .onFailure { status += "seed_${index}_artist_catalog_failed" }
+            }
         }
 
-        val seedTags = runCatching { fetchArtistTags(artist.first) }
-            .onFailure { status += "tags_failed" }
-            .getOrDefault(emptySet())
-
-        runCatching { fetchArtistRadio(artist.first, "easy", 16, 5) }
-            .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "artist_easy:${rows.size}" }
-            .onFailure { status += "artist_easy_failed" }
-
-        runCatching { fetchArtistRadio(artist.first, "medium", 24, 4) }
-            .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "artist_medium:${rows.size}" }
-            .onFailure { status += "artist_medium_failed" }
-
-        seedTags.take(4).forEach { tag ->
+        seedTags.take(3).forEach { tag ->
+            if (collected.size >= 90) return@forEach
             runCatching { fetchTagRadio(tag) }
                 .onSuccess { rows ->
                     rows.forEach { collected.putIfAbsent(it.key, it.copy(tags = it.tags + tag.lowercase())) }
@@ -61,34 +85,47 @@ object RecommendationClient {
                 .onFailure { status += "tag_${tag}_failed" }
         }
 
-        // Always add a catalog floor. This stops an otherwise good artist match from producing
-        // zero candidates when ListenBrainz radio has a temporary empty response.
-        if (collected.size < 50) {
-            runCatching { searchRecordingsByArtist(artist.second, 50) }
-                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "artist_catalog:${rows.size}" }
-                .onFailure { status += "artist_catalog_failed" }
-        }
-
-        if (collected.size < 55) {
-            seedTags.take(2).forEach { tag ->
-                runCatching { searchRecordingsByTag(tag, 30) }
+        // Reliable floor: if recommendation endpoints are sparse, use direct catalog searches for
+        // each parsed artist. These are still based on the current song, never old-session history.
+        if (collected.size < 35) {
+            seeds.take(3).forEachIndexed { index, seedName ->
+                runCatching { searchRecordingsLoose(seedName, 45) }
                     .onSuccess { rows ->
-                        rows.forEach { collected.putIfAbsent(it.key, it.copy(tags = it.tags + tag.lowercase())) }
-                        status += "tag_catalog_${tag}:${rows.size}"
+                        rows.forEach { collected.putIfAbsent(it.key, it) }
+                        status += "seed_${index}_loose:${rows.size}"
                     }
-                    .onFailure { status += "tag_catalog_${tag}_failed" }
+                    .onFailure { status += "seed_${index}_loose_failed" }
             }
         }
 
-        // Final broad fallback: retry the artist catalog with a looser query if every specialized
-        // source failed. This is deliberately current-artist scoped, not old-session history.
+        // Last non-empty fallback for unusual credits: query the full credit text and the track
+        // title. It is intentionally lower quality than artist-radio results but prevents a total
+        // dead end when public metadata services have incomplete Turkish artist mappings.
         if (collected.isEmpty()) {
-            runCatching { searchRecordingsLoose(current.artist, 60) }
-                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "loose_catalog:${rows.size}" }
-                .onFailure { status += "loose_catalog_failed" }
+            runCatching { searchRecordingsLoose(current.artist, 50) }
+                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "full_credit_fallback:${rows.size}" }
+                .onFailure { status += "full_credit_fallback_failed" }
+        }
+        if (collected.isEmpty() && current.title.isNotBlank()) {
+            runCatching { searchRecordingsLoose(current.title, 35) }
+                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "title_fallback:${rows.size}" }
+                .onFailure { status += "title_fallback_failed" }
         }
 
-        return DiscoveryResult(collected.values.take(140), seedTags, status)
+        // Never recommend the exact song that is currently playing.
+        collected.remove(current.key)
+        return DiscoveryResult(collected.values.take(140), seedTags.take(8).toSet(), status)
+    }
+
+    private fun splitArtistSeeds(raw: String): List<String> {
+        val cleaned = raw
+            .replace(Regex("(?i)\\s+(feat\\.?|ft\\.?|featuring)\\s+"), " | ")
+            .replace(Regex("(?i)\\s+[xX]\\s+"), " | ")
+            .replace(Regex("\\s+[&+]\\s+"), " | ")
+            .replace(Regex("(?i)\\s+ve\\s+"), " | ")
+            .replace(Regex("\\s*,\\s*"), " | ")
+        val parts = cleaned.split("|").map { it.trim() }.filter { it.length >= 2 }.distinctBy { it.lowercase() }
+        return if (parts.isEmpty()) listOf(raw.trim()) else parts
     }
 
     private fun fetchArtistRadio(artistMbid: String, mode: String, similarArtists: Int, recordingsPerArtist: Int): List<Track> {
@@ -153,20 +190,12 @@ object RecommendationClient {
 
     private fun searchRecordingsByArtist(artist: String, limit: Int): List<Track> {
         val q = URLEncoder.encode("artist:\"$artist\"", StandardCharsets.UTF_8.toString())
-        val root = getJson("https://musicbrainz.org/ws/2/recording/?query=$q&fmt=json&limit=$limit")
-        return parseRecordingSearch(root, "musicbrainz:artist")
+        return parseRecordingSearch(getJson("https://musicbrainz.org/ws/2/recording/?query=$q&fmt=json&limit=$limit"), "musicbrainz:artist")
     }
 
-    private fun searchRecordingsLoose(artist: String, limit: Int): List<Track> {
-        val q = URLEncoder.encode(artist, StandardCharsets.UTF_8.toString())
-        val root = getJson("https://musicbrainz.org/ws/2/recording/?query=$q&fmt=json&limit=$limit")
-        return parseRecordingSearch(root, "musicbrainz:loose")
-    }
-
-    private fun searchRecordingsByTag(tag: String, limit: Int): List<Track> {
-        val q = URLEncoder.encode("tag:\"$tag\"", StandardCharsets.UTF_8.toString())
-        val root = getJson("https://musicbrainz.org/ws/2/recording/?query=$q&fmt=json&limit=$limit")
-        return parseRecordingSearch(root, "musicbrainz:tag:$tag").map { it.copy(tags = setOf(tag.lowercase())) }
+    private fun searchRecordingsLoose(query: String, limit: Int): List<Track> {
+        val q = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
+        return parseRecordingSearch(getJson("https://musicbrainz.org/ws/2/recording/?query=$q&fmt=json&limit=$limit"), "musicbrainz:loose")
     }
 
     private fun parseRecordingSearch(root: JSONObject, source: String): List<Track> {
@@ -241,7 +270,6 @@ object RecommendationClient {
 
         val isMusicBrainz = url.contains("musicbrainz.org")
         var lastError: Throwable? = null
-
         repeat(3) { attempt ->
             try {
                 if (isMusicBrainz) throttleMusicBrainz()
@@ -256,7 +284,7 @@ object RecommendationClient {
                     cache[url] = System.currentTimeMillis() to JSONObject(json.toString())
                     return json
                 }
-                if (code == 429 || code == 503 || code == 502 || code == 504) {
+                if (code == 429 || code == 502 || code == 503 || code == 504) {
                     val retryAfter = conn.getHeaderField("Retry-After")?.toLongOrNull()?.times(1000L)
                     Thread.sleep(retryAfter ?: (900L * (attempt + 1)))
                     lastError = IllegalStateException("HTTP $code")
