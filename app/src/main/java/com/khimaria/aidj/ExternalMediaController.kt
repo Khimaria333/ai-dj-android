@@ -2,9 +2,11 @@ package com.khimaria.aidj
 
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.net.Uri
 import android.os.Bundle
 
 object ExternalMediaController {
@@ -17,11 +19,6 @@ object ExternalMediaController {
 
     private const val YOUTUBE_MUSIC = "com.google.android.apps.youtube.music"
 
-    /**
-     * Tries to ask YouTube Music's own active MediaSession to play an exact search query.
-     * This uses Android's public MediaSession transport API and the notification-listener
-     * permission that AI DJ already requires; it does not automate/tap YouTube Music's UI.
-     */
     fun playYoutubeMusicSearch(context: Context, title: String, artist: String): Result {
         val controller = findYoutubeMusicController(context)
             ?: return Result(false, "none", 0L, "YouTube Music aktif MediaSession bulunamadı")
@@ -31,12 +28,39 @@ object ExternalMediaController {
 
         val actions = controller.playbackState?.actions ?: 0L
         return try {
-            // The platform method exists for all MediaSessions. Individual apps may choose
-            // whether to implement the callback, so the APK exposes this as a capability test.
             controller.transportControls.playFromSearch(query, Bundle.EMPTY)
             Result(true, "playFromSearch", actions, "YouTube Music'e playFromSearch gönderildi")
         } catch (t: Throwable) {
             Result(false, "playFromSearch", actions, t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    fun playYoutubeMusicVideo(context: Context, videoId: String): Result {
+        if (videoId.isBlank()) return Result(false, "none", 0L, "YouTube video kimliği boş")
+        val controller = findYoutubeMusicController(context)
+        val actions = controller?.playbackState?.actions ?: 0L
+        val uri = Uri.parse("https://music.youtube.com/watch?v=$videoId&t=0")
+
+        if (controller != null && actions and PlaybackState.ACTION_PLAY_FROM_URI != 0L) {
+            return try {
+                controller.transportControls.playFromUri(uri, Bundle.EMPTY)
+                Result(true, "playFromUri", actions, "YouTube Music'e doğrudan parça URI'si gönderildi")
+            } catch (_: Throwable) {
+                openYoutubeMusicUri(context, uri, actions)
+            }
+        }
+        return openYoutubeMusicUri(context, uri, actions)
+    }
+
+    private fun openYoutubeMusicUri(context: Context, uri: Uri, actions: Long): Result {
+        return try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
+                setPackage(YOUTUBE_MUSIC)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            })
+            Result(true, "watchUri", actions, "YouTube Music doğrudan watch URI ile açıldı")
+        } catch (t: Throwable) {
+            Result(false, "watchUri", actions, t.message ?: t.javaClass.simpleName)
         }
     }
 
