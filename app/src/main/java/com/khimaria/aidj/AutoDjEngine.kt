@@ -23,8 +23,6 @@ data class RankedRecommendation(
 )
 
 object AutoDjEngine {
-    // The current listening context is intentionally short-lived. Long-term taste remains
-    // available through likes/listen/skip counters, but old sessions must not steer today's flow.
     private const val SESSION_GAP_MS = 60L * 60L * 1000L
 
     fun rank(
@@ -43,8 +41,6 @@ object AutoDjEngine {
         val sessionCutoff = now - SESSION_GAP_MS
         val sessionHistory = history.filter { it.observedAtMs > 0L && it.observedAtMs >= sessionCutoff }
 
-        // MainActivity used to put the last global-history entries into avoid. Strip those old
-        // entries here so another listening session cannot accidentally become today's context.
         val historyKeys = history.map { it.key }.toSet()
         val explicitAvoid = avoid.filterTo(mutableSetOf()) { key ->
             key !in historyKeys || sessionHistory.any { it.key == key }
@@ -52,7 +48,6 @@ object AutoDjEngine {
         val recentTracks = sessionHistory.take(8).map { it.key }.toSet() + explicitAvoid
         val recentArtists = sessionHistory.take(5).map { it.artist.lowercase() }.filter { it.isNotBlank() }
 
-        // These are long-term taste signals. They influence preference, not the current-session flow.
         val likedArtists = history.filter { it.key in liked }.map { it.artist.lowercase() }.toSet()
         val dislikedArtists = history.filter { it.key in disliked }.map { it.artist.lowercase() }.toSet()
         val seed = seedTags.map { it.lowercase() }.toSet()
@@ -66,11 +61,16 @@ object AutoDjEngine {
                 val artistKey = track.artist.lowercase()
                 val seenIndex = history.indexOfFirst { it.key == track.key }
 
+                // Provider identity is only a confidence signal. Musical/context signals below are
+                // allowed to outweigh it, so the engine does not simply pick from one API.
                 when {
-                    track.source.startsWith("artist:easy") -> { score += 34; reasons += "yakın sanatçı" }
-                    track.source.startsWith("artist:medium") -> { score += 27; reasons += "benzer sanatçı" }
-                    track.source.startsWith("tag:") -> { score += 24; reasons += "tür / mood" }
-                    track.source.startsWith("musicbrainz:") -> { score += 14; reasons += "katalog keşfi" }
+                    track.source.startsWith("artist:easy") -> { score += 30; reasons += "yakın sanatçı" }
+                    track.source.startsWith("artist:medium") -> { score += 24; reasons += "benzer sanatçı" }
+                    track.source.startsWith("tag:") -> { score += 21; reasons += "tür / mood" }
+                    track.source.startsWith("itunes:artist") -> { score += 17; reasons += "bağımsız katalog" }
+                    track.source.startsWith("itunes:genre") -> { score += 14; reasons += "geniş tür kataloğu" }
+                    track.source.startsWith("itunes:") -> { score += 11; reasons += "yedek katalog" }
+                    track.source.startsWith("musicbrainz:") -> { score += 13; reasons += "açık katalog" }
                     track.source == "history" -> score -= 8
                 }
 
@@ -82,7 +82,6 @@ object AutoDjEngine {
                     }
                     reasons += "yeni keşif"
                 } else {
-                    // Old listening is not a flow blocker; it only gives a small familiarity cost.
                     score -= 5
                     reasons += "daha önce dinlendi"
                 }
@@ -99,8 +98,6 @@ object AutoDjEngine {
                 val listens = listenedCounts[track.key] ?: 0
                 if (listens > 0) score += (listens * 5).coerceAtMost(15)
 
-                // Same artist is allowed. It receives only a gentle diversity nudge so a genuinely
-                // stronger musical match can still win instead of being rejected by artist name.
                 if (artistKey.isNotBlank()) {
                     val repeats = recentArtists.count { it == artistKey }
                     if (repeats > 0) score -= (repeats * 5).coerceAtMost(12)
@@ -124,7 +121,6 @@ object AutoDjEngine {
                     }
                 }
 
-                // Small deterministic tiebreaker only; it is not presented as musical compatibility.
                 score += ((track.key.hashCode() xor (current?.key?.hashCode() ?: 0)) and 3)
                 RankedRecommendation(track, score, reasons.distinct().take(4))
             }
