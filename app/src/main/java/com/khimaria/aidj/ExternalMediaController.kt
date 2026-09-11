@@ -23,16 +23,15 @@ object ExternalMediaController {
         val controller = findYoutubeMusicController(context)
             ?: return Result(false, "none", 0L, "YouTube Music aktif MediaSession bulunamadı")
 
-        // First prefer an exact item already present in YouTube Music's own active queue.
-        findQueueItemId(controller, title, artist)?.let { queueId ->
-            return try {
+        val queueId = findQueueItemId(controller, title, artist)
+        if (queueId != null) {
+            try {
                 controller.transportControls.skipToQueueItem(queueId)
-                Result(true, "skipToQueueItem", controller.playbackState?.actions ?: 0L, "Hedef parça YouTube Music kuyruğunda bulundu")
+                return Result(true, "skipToQueueItem", controller.playbackState?.actions ?: 0L, "Hedef parça YouTube Music kuyruğunda bulundu")
             } catch (_: Throwable) {
-                // Continue to search command below.
-                Result(false, "skipToQueueItem", controller.playbackState?.actions ?: 0L, "Kuyruk öğesi açılamadı")
+                // Queue handoff failed; continue with search fallback.
             }
-        }?.takeIf { it.sent }?.let { return it }
+        }
 
         val query = listOf(title.trim(), artist.trim()).filter { it.isNotBlank() }.joinToString(" ")
         if (query.isBlank()) return Result(false, "none", controller.playbackState?.actions ?: 0L, "Arama metni boş")
