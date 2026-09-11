@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.AIDJ" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:navigationBarColor">#090B10</item>
+        <item name="android:statusBarColor">#090B10</item>
+        <item name="colorPrimary">#7C4DFF</item>
+        <item name="colorSecondary">#00E5FF</item>
+    </style>
+</resources>
