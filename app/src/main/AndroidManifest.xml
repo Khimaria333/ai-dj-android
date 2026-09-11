@@ -18,7 +18,7 @@
         </service>
 
         <activity
-            android:name=".MainActivityV05"
+            android:name=".MainActivityV06"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -26,6 +26,7 @@
             </intent-filter>
         </activity>
 
+        <activity android:name=".MainActivityV05" android:exported="false" />
         <activity android:name=".MainActivityV04" android:exported="false" />
         <activity android:name=".MainActivity" android:exported="false" />
     </application>
