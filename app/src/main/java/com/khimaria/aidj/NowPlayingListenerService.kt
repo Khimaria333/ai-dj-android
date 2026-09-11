@@ -7,12 +7,16 @@ import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.os.Handler
+import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 
 class NowPlayingListenerService : NotificationListenerService() {
     private val controllers = mutableListOf<MediaController>()
     private val callbacks = mutableMapOf<MediaController, MediaController.Callback>()
+    private val handler = Handler(Looper.getMainLooper())
+    private var handoffRunnable: Runnable? = null
 
     private var trackedTitle = ""
     private var trackedArtist = ""
@@ -27,6 +31,7 @@ class NowPlayingListenerService : NotificationListenerService() {
     }
 
     override fun onListenerDisconnected() {
+        cancelAutoHandoff()
         clearControllers()
         super.onListenerDisconnected()
     }
@@ -36,7 +41,6 @@ class NowPlayingListenerService : NotificationListenerService() {
         val pkg = sbn.packageName ?: return
         if (!isSupported(pkg)) return
 
-        // MediaSession is the primary source. Notification parsing is only a fallback.
         refreshSessions()
         val extras = sbn.notification.extras
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
@@ -108,6 +112,7 @@ class NowPlayingListenerService : NotificationListenerService() {
             trackedArtist = artist
             trackedPackage = pkg
             listenedMs = 0L
+            cancelAutoHandoff()
         }
 
         lastClockAt = now
@@ -138,7 +143,66 @@ class NowPlayingListenerService : NotificationListenerService() {
             putExtra(EXTRA_PREVIOUS_PACKAGE, previousPackage)
             putExtra(EXTRA_PREVIOUS_LISTENED_MS, previousListenedMs)
         })
+
+        if (pkg == YOUTUBE_MUSIC && durationMs > 0L && playbackState == PlaybackState.STATE_PLAYING) {
+            scheduleAutoHandoff(positionMs, durationMs)
+        }
     }
+
+    private fun scheduleAutoHandoff(positionMs: Long, durationMs: Long) {
+        cancelAutoHandoff()
+        val remaining = (durationMs - positionMs).coerceAtLeast(0L)
+        if (remaining < 2_000L) return
+
+        val delay = (remaining - HANDOFF_LEAD_MS).coerceAtLeast(1_000L)
+        val expectedKey = normalizedKey(trackedTitle, trackedArtist)
+        val runnable = Runnable { tryAutoHandoff(expectedKey) }
+        handoffRunnable = runnable
+        handler.postDelayed(runnable, delay)
+    }
+
+    private fun tryAutoHandoff(expectedKey: String) {
+        if (!wasPlaying || trackedPackage != YOUTUBE_MUSIC) return
+        if (normalizedKey(trackedTitle, trackedArtist) != expectedKey) return
+
+        val autoEnabled = getSharedPreferences("aidj_v07", MODE_PRIVATE).getBoolean("auto", true)
+        if (!autoEnabled) return
+
+        val pick = AutoDjEngine.pendingRecommendation
+        val pickFor = AutoDjEngine.pendingForTrackKey
+        if (pick == null || pickFor != expectedKey) {
+            // Recommendation generation can finish slightly later on a slow network.
+            val retry = Runnable { tryAutoHandoff(expectedKey) }
+            handoffRunnable = retry
+            handler.postDelayed(retry, 700L)
+            return
+        }
+
+        val before = expectedKey
+        val result = ExternalMediaController.playYoutubeMusicSearch(this, pick.track.title, pick.track.artist)
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString("last_handoff_method", result.method)
+            .putString("last_handoff_message", result.message)
+            .putString("last_handoff_target", pick.track.display)
+            .putLong("last_handoff_at", System.currentTimeMillis())
+            .apply()
+
+        // Some media apps expose the generic command but ignore playFromSearch. If the active
+        // track did not change after a short grace period, fall back to their own next-queue item
+        // instead of leaving playback stuck at the end.
+        handler.postDelayed({
+            if (normalizedKey(trackedTitle, trackedArtist) == before && trackedPackage == YOUTUBE_MUSIC) {
+                ExternalMediaController.skipYoutubeMusicNext(this)
+            }
+        }, 3_500L)
+    }
+
+    private fun cancelAutoHandoff() {
+        handoffRunnable?.let { handler.removeCallbacks(it) }
+        handoffRunnable = null
+    }
+
+    private fun normalizedKey(title: String, artist: String) = "${title.lowercase()}|${artist.lowercase()}"
 
     private fun clearControllers() {
         callbacks.forEach { (controller, callback) -> runCatching { controller.unregisterCallback(callback) } }
@@ -146,9 +210,12 @@ class NowPlayingListenerService : NotificationListenerService() {
         controllers.clear()
     }
 
-    private fun isSupported(pkg: String) = pkg == "com.google.android.apps.youtube.music" || pkg == "com.spotify.music"
+    private fun isSupported(pkg: String) = pkg == YOUTUBE_MUSIC || pkg == "com.spotify.music"
 
     companion object {
+        private const val YOUTUBE_MUSIC = "com.google.android.apps.youtube.music"
+        private const val HANDOFF_LEAD_MS = 800L
+
         const val ACTION_NOW_PLAYING = "com.khimaria.aidj.NOW_PLAYING"
         const val EXTRA_TITLE = "title"
         const val EXTRA_ARTIST = "artist"
