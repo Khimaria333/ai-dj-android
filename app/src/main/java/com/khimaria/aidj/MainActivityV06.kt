@@ -38,6 +38,7 @@ class MainActivityV06 : AppCompatActivity() {
     private val history = mutableListOf<Track>()
     private val liked = mutableSetOf<String>()
     private val disliked = mutableSetOf<String>()
+    private val rejectedRecommendations = linkedSetOf<String>()
     private var lastSeedTags: Set<String> = emptySet()
     private var generation = 0
 
@@ -53,6 +54,9 @@ class MainActivityV06 : AppCompatActivity() {
             if (track.key == current?.key) return
 
             current = track
+            rejectedRecommendations.clear()
+            currentRecommendation = null
+
             history.removeAll { it.key == track.key }
             history.add(0, track)
             while (history.size > 150) history.removeLast()
@@ -92,7 +96,7 @@ class MainActivityV06 : AppCompatActivity() {
         }
 
         root.addView(label("AI DJ", 38f))
-        root.addView(label("v0.6 • DJ seçim motoru", 16f, Color.CYAN))
+        root.addView(label("v0.6.1 • DJ seçim motoru", 16f, Color.CYAN))
         root.addView(label(
             "Çalan parçayı, son set akışını, global benzerlik/tür sinyallerini, popülerlik, tekrar cezası ve kişisel beğenilerini birlikte puanlar.",
             14f,
@@ -120,9 +124,11 @@ class MainActivityV06 : AppCompatActivity() {
                 FlowMode.BALANCED -> FlowMode.DISCOVERY
                 FlowMode.DISCOVERY -> FlowMode.SAFE
             }
+            rejectedRecommendations.clear()
+            currentRecommendation = null
             flowButton.text = flowLabel()
             saveState()
-            if (autoMode) produceRecommendation(true)
+            if (autoMode) produceRecommendation()
         }
         root.addView(flowButton)
 
@@ -132,7 +138,9 @@ class MainActivityV06 : AppCompatActivity() {
             setOnClickListener {
                 current?.let {
                     liked.add(it.key); disliked.remove(it.key); saveState(); toast("Tercihin kaydedildi")
-                    if (autoMode) produceRecommendation(true)
+                    rejectedRecommendations.clear()
+                    currentRecommendation = null
+                    if (autoMode) produceRecommendation()
                 }
             }
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -141,7 +149,9 @@ class MainActivityV06 : AppCompatActivity() {
             setOnClickListener {
                 current?.let {
                     disliked.add(it.key); liked.remove(it.key); saveState(); toast("Bu parça geri plana alındı")
-                    if (autoMode) produceRecommendation(true)
+                    rejectedRecommendations.clear()
+                    currentRecommendation = null
+                    if (autoMode) produceRecommendation()
                 }
             }
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -153,7 +163,12 @@ class MainActivityV06 : AppCompatActivity() {
         root.addView(detailText)
 
         root.addView(button("BAŞKA ADAY SEÇ") {
-            if (autoMode) produceRecommendation(true) else toast("Önce Auto DJ'yi aç")
+            if (!autoMode) {
+                toast("Önce Auto DJ'yi aç")
+            } else {
+                currentRecommendation?.track?.let { rejectedRecommendations.add(it.key) }
+                produceRecommendation()
+            }
         })
         root.addView(button("SEÇİMİ YOUTUBE MUSIC'TE ARA") {
             currentRecommendation?.track?.let { openYoutubeMusic(it.display) } ?: toast("Henüz seçim yok")
@@ -173,7 +188,7 @@ class MainActivityV06 : AppCompatActivity() {
         if (autoMode && current != null) produceRecommendation()
     }
 
-    private fun produceRecommendation(forceDifferent: Boolean = false) {
+    private fun produceRecommendation() {
         val playing = current ?: run {
             setRecommendationMessage("Önce YouTube Music'te bir şarkı çal")
             return
@@ -183,8 +198,7 @@ class MainActivityV06 : AppCompatActivity() {
         recommendation.text = "AI sıradaki seçim\nGlobal adaylar analiz ediliyor…"
         detailText.text = ""
 
-        val avoid = history.take(6).map { it.key }.toMutableSet()
-        if (forceDifferent) currentRecommendation?.track?.let { avoid.add(it.key) }
+        val avoid = (history.take(6).map { it.key } + rejectedRecommendations).toMutableSet()
 
         thread {
             val discovery = runCatching { RecommendationClient.discover(playing) }
@@ -201,11 +215,23 @@ class MainActivityV06 : AppCompatActivity() {
                 seedTags = discovery.seedTags,
                 mode = flowMode
             )
+
             val chosen = ranked.firstOrNull()
 
             runOnUiThread {
                 if (myGeneration != generation) return@runOnUiThread
+
                 lastSeedTags = discovery.seedTags
+
+                if (chosen == null && rejectedRecommendations.isNotEmpty()) {
+                    rejectedRecommendations.clear()
+                    currentRecommendation = null
+                    recommendation.text = "AI sıradaki seçim\nAday listesi yenileniyor…"
+                    detailText.text = "Bu parça için tüm uygun adayları gezdik."
+                    produceRecommendation()
+                    return@runOnUiThread
+                }
+
                 currentRecommendation = chosen
                 if (chosen == null) {
                     recommendation.text = "AI sıradaki seçim\nUygun aday bulunamadı"
@@ -214,7 +240,8 @@ class MainActivityV06 : AppCompatActivity() {
                     recommendation.text = "AI sıradaki seçim\n${chosen.track.display}"
                     val reason = chosen.reasons.joinToString(" • ").ifBlank { "çoklu sinyal puanlaması" }
                     val tagText = if (discovery.seedTags.isEmpty()) "" else "\nAkış etiketleri: ${discovery.seedTags.take(4).joinToString(", ")}"
-                    detailText.text = "Uyumluluk skoru: ${chosen.score}\n$reason$tagText\nAday havuzu: ${ranked.size} parça"
+                    val skippedText = if (rejectedRecommendations.isEmpty()) "" else "\nBu turda atlanan: ${rejectedRecommendations.size}"
+                    detailText.text = "Uyumluluk skoru: ${chosen.score}\n$reason$tagText\nAday havuzu: ${ranked.size} parça$skippedText"
                 }
             }
         }
