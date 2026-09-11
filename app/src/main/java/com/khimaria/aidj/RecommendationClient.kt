@@ -9,7 +9,7 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 
 object RecommendationClient {
-    private const val USER_AGENT = "AI-DJ-Android/0.7.2 (https://github.com/Khimaria333/ai-dj-android)"
+    private const val USER_AGENT = "AI-DJ-Android/0.8 (https://github.com/Khimaria333/ai-dj-android)"
     private const val MUSICBRAINZ_MIN_INTERVAL_MS = 1150L
     private const val CACHE_TTL_MS = 30L * 60L * 1000L
 
@@ -32,9 +32,20 @@ object RecommendationClient {
         val seeds = splitArtistSeeds(current.artist)
         status += "artist_seeds:${seeds.joinToString("+")}" 
 
-        // Collaborative credits such as "Sufle ve Teoman", "A & B", "A feat. B" used to be
-        // searched as one literal artist and could collapse the pool to zero. Resolve each real
-        // artist independently and merge the results.
+        // Source 1: Apple/iTunes public catalog search. This source is independent from
+        // MusicBrainz/ListenBrainz and is intentionally queried early so one metadata provider
+        // cannot collapse the complete discovery pool to zero.
+        seeds.take(3).forEachIndexed { index, seedName ->
+            runCatching { searchITunes(seedName, 35, "itunes:artist") }
+                .onSuccess { rows ->
+                    rows.forEach { collected.putIfAbsent(it.key, it) }
+                    status += "itunes_seed_${index}:${rows.size}"
+                }
+                .onFailure { status += "itunes_seed_${index}_failed" }
+        }
+
+        // Sources 2+3: MusicBrainz resolves canonical artists/tags, then ListenBrainz supplies
+        // related-artist and tag-radio candidates. Every source is isolated with runCatching.
         seeds.take(3).forEachIndexed { index, seedName ->
             val artist = runCatching { findArtist(seedName) }.getOrNull()
             if (artist == null) {
@@ -65,7 +76,7 @@ object RecommendationClient {
                 }
                 .onFailure { status += "seed_${index}_medium_failed" }
 
-            if (collected.size < 45) {
+            if (collected.size < 55) {
                 runCatching { searchRecordingsByArtist(artist.second, 40) }
                     .onSuccess { rows ->
                         rows.forEach { collected.putIfAbsent(it.key, it) }
@@ -75,19 +86,29 @@ object RecommendationClient {
             }
         }
 
-        seedTags.take(3).forEach { tag ->
-            if (collected.size >= 90) return@forEach
-            runCatching { fetchTagRadio(tag) }
-                .onSuccess { rows ->
-                    rows.forEach { collected.putIfAbsent(it.key, it.copy(tags = it.tags + tag.lowercase())) }
-                    status += "tag_${tag}:${rows.size}"
-                }
-                .onFailure { status += "tag_${tag}_failed" }
+        // Genre/mood expansion from two separate providers. iTunes genre-term results are noisy,
+        // so they are secondary candidates and receive a lower ranking weight than related-artist radio.
+        seedTags.take(3).forEachIndexed { index, tag ->
+            if (collected.size < 120) {
+                runCatching { searchITunes(tag, 24, "itunes:genre") }
+                    .onSuccess { rows ->
+                        rows.forEach { collected.putIfAbsent(it.key, it.copy(tags = it.tags + tag.lowercase())) }
+                        status += "itunes_tag_${index}:${rows.size}"
+                    }
+                    .onFailure { status += "itunes_tag_${index}_failed" }
+            }
+            if (collected.size < 110) {
+                runCatching { fetchTagRadio(tag) }
+                    .onSuccess { rows ->
+                        rows.forEach { collected.putIfAbsent(it.key, it.copy(tags = it.tags + tag.lowercase())) }
+                        status += "tag_${tag}:${rows.size}"
+                    }
+                    .onFailure { status += "tag_${tag}_failed" }
+            }
         }
 
-        // Reliable floor: if recommendation endpoints are sparse, use direct catalog searches for
-        // each parsed artist. These are still based on the current song, never old-session history.
-        if (collected.size < 35) {
+        // Direct MusicBrainz catalog floor, based only on the current song context.
+        if (collected.size < 45) {
             seeds.take(3).forEachIndexed { index, seedName ->
                 runCatching { searchRecordingsLoose(seedName, 45) }
                     .onSuccess { rows ->
@@ -98,9 +119,13 @@ object RecommendationClient {
             }
         }
 
-        // Last non-empty fallback for unusual credits: query the full credit text and the track
-        // title. It is intentionally lower quality than artist-radio results but prevents a total
-        // dead end when public metadata services have incomplete Turkish artist mappings.
+        // Last online fallbacks. The Apple query is independent and therefore useful when the
+        // open MusicBrainz family is temporarily unavailable.
+        if (collected.isEmpty()) {
+            runCatching { searchITunes("${current.artist} ${current.title}", 50, "itunes:fallback") }
+                .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "itunes_full_fallback:${rows.size}" }
+                .onFailure { status += "itunes_full_fallback_failed" }
+        }
         if (collected.isEmpty()) {
             runCatching { searchRecordingsLoose(current.artist, 50) }
                 .onSuccess { rows -> rows.forEach { collected.putIfAbsent(it.key, it) }; status += "full_credit_fallback:${rows.size}" }
@@ -112,9 +137,8 @@ object RecommendationClient {
                 .onFailure { status += "title_fallback_failed" }
         }
 
-        // Never recommend the exact song that is currently playing.
         collected.remove(current.key)
-        return DiscoveryResult(collected.values.take(140), seedTags.take(8).toSet(), status)
+        return DiscoveryResult(collected.values.take(180), seedTags.take(8).toSet(), status)
     }
 
     private fun splitArtistSeeds(raw: String): List<String> {
@@ -126,6 +150,25 @@ object RecommendationClient {
             .replace(Regex("\\s*,\\s*"), " | ")
         val parts = cleaned.split("|").map { it.trim() }.filter { it.length >= 2 }.distinctBy { it.lowercase() }
         return if (parts.isEmpty()) listOf(raw.trim()) else parts
+    }
+
+    private fun searchITunes(query: String, limit: Int, source: String): List<Track> {
+        val encoded = URLEncoder.encode(query, StandardCharsets.UTF_8.toString())
+        val url = "https://itunes.apple.com/search?term=$encoded&country=TR&media=music&entity=song&limit=${limit.coerceIn(1, 80)}"
+        val root = getJson(url)
+        val rows = root.optJSONArray("results") ?: return emptyList()
+        val out = mutableListOf<Track>()
+        for (i in 0 until rows.length()) {
+            val item = rows.optJSONObject(i) ?: continue
+            if (item.optString("kind") != "song") continue
+            val title = item.optString("trackName").trim()
+            val artist = item.optString("artistName").trim()
+            if (title.isBlank() || artist.isBlank()) continue
+            val genre = item.optString("primaryGenreName").trim().lowercase()
+            val tags = if (genre.isBlank()) emptySet() else setOf(genre)
+            out += Track(title = title, artist = artist, source = source, tags = tags)
+        }
+        return out.distinctBy { it.key }
     }
 
     private fun fetchArtistRadio(artistMbid: String, mode: String, similarArtists: Int, recordingsPerArtist: Int): List<Track> {
