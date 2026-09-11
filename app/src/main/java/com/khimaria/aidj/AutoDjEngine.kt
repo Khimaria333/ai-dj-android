@@ -30,12 +30,15 @@ object AutoDjEngine {
         disliked: Set<String>,
         avoid: Set<String> = emptySet(),
         seedTags: Set<String> = emptySet(),
-        mode: FlowMode = FlowMode.BALANCED
+        mode: FlowMode = FlowMode.BALANCED,
+        skipCounts: Map<String, Int> = emptyMap(),
+        listenedCounts: Map<String, Int> = emptyMap()
     ): List<RankedRecommendation> {
-        val recentTracks = history.take(6).map { it.key }.toSet() + avoid
-        val recentArtists = history.take(4).map { it.artist.lowercase() }.filter { it.isNotBlank() }
+        val recentTracks = history.take(8).map { it.key }.toSet() + avoid
+        val recentArtists = history.take(5).map { it.artist.lowercase() }.filter { it.isNotBlank() }
         val likedArtists = history.filter { it.key in liked }.map { it.artist.lowercase() }.toSet()
         val dislikedArtists = history.filter { it.key in disliked }.map { it.artist.lowercase() }.toSet()
+        val seed = seedTags.map { it.lowercase() }.toSet()
 
         return candidates
             .distinctBy { it.key }
@@ -47,50 +50,59 @@ object AutoDjEngine {
                 val seenIndex = history.indexOfFirst { it.key == track.key }
 
                 when {
-                    track.source.startsWith("artist:easy") -> { score += 34; reasons += "yakın sanatçı eşleşmesi" }
-                    track.source.startsWith("artist:medium") -> { score += 27; reasons += "benzer sanatçı keşfi" }
-                    track.source.startsWith("tag:") -> { score += 22; reasons += "tür/mood eşleşmesi" }
-                    track.source == "history" -> score += 5
+                    track.source.startsWith("artist:easy") -> { score += 34; reasons += "yakın sanatçı" }
+                    track.source.startsWith("artist:medium") -> { score += 27; reasons += "benzer sanatçı" }
+                    track.source.startsWith("tag:") -> { score += 24; reasons += "tür / mood" }
+                    track.source.startsWith("musicbrainz:") -> { score += 14; reasons += "katalog keşfi" }
+                    track.source == "history" -> score -= 8
                 }
 
                 if (seenIndex < 0) {
                     score += when (mode) {
-                        FlowMode.SAFE -> 7
-                        FlowMode.BALANCED -> 17
-                        FlowMode.DISCOVERY -> 30
+                        FlowMode.SAFE -> 5
+                        FlowMode.BALANCED -> 16
+                        FlowMode.DISCOVERY -> 28
                     }
                     reasons += "yeni keşif"
                 } else {
-                    score += (12 - seenIndex.coerceAtMost(12)) / 2
+                    score -= 10 + (8 - seenIndex.coerceAtMost(8))
+                    reasons += "daha önce dinlendi"
                 }
 
-                if (track.key in liked) { score += 38; reasons += "beğeni geçmişin" }
+                if (track.key in liked) { score += 40; reasons += "beğendin" }
                 if (artistKey in likedArtists) { score += 14; reasons += "sevdiğin sanatçı çizgisi" }
-                if (artistKey in dislikedArtists) score -= 25
+                if (artistKey in dislikedArtists) score -= 28
+
+                val skips = skipCounts[track.key] ?: 0
+                if (skips > 0) {
+                    score -= (skips * 22).coerceAtMost(66)
+                    reasons += "skip cezası"
+                }
+                val listens = listenedCounts[track.key] ?: 0
+                if (listens > 0) score += (listens * 5).coerceAtMost(15)
 
                 if (artistKey.isNotBlank()) {
                     val repeats = recentArtists.count { it == artistKey }
-                    score -= repeats * 24
-                    if (current != null && artistKey == current.artist.lowercase()) score -= 18
+                    score -= repeats * 26
+                    if (current != null && artistKey == current.artist.lowercase()) score -= 20
                 }
 
-                val overlap = track.tags.map { it.lowercase() }.toSet().intersect(seedTags.map { it.lowercase() }.toSet())
+                val overlap = track.tags.map { it.lowercase() }.toSet().intersect(seed)
                 if (overlap.isNotEmpty()) {
-                    score += (overlap.size * 7).coerceAtMost(21)
+                    score += (overlap.size * 8).coerceAtMost(24)
                     reasons += "${overlap.take(2).joinToString("/")} uyumu"
                 }
 
                 track.popularity?.let { pop ->
                     when {
-                        pop in 35..85 -> { score += 10; reasons += "güçlü dinleyici sinyali" }
-                        pop > 95 -> score -= if (mode == FlowMode.DISCOVERY) 8 else 0
-                        pop < 8 -> score -= if (mode == FlowMode.SAFE) 10 else 2
+                        pop in 28..88 -> { score += 10; reasons += "güçlü dinleyici sinyali" }
+                        pop > 96 -> score -= if (mode == FlowMode.DISCOVERY) 8 else 0
+                        pop < 6 -> score -= if (mode == FlowMode.SAFE) 12 else 3
                     }
                 }
 
-                val deterministicVariety = ((track.key.hashCode() xor (current?.key?.hashCode() ?: 0)) and 7)
-                score += deterministicVariety
-
+                // Small deterministic tiebreaker only; it is not presented as musical compatibility.
+                score += ((track.key.hashCode() xor (current?.key?.hashCode() ?: 0)) and 3)
                 RankedRecommendation(track, score, reasons.distinct().take(4))
             }
             .sortedByDescending { it.score }
@@ -104,6 +116,8 @@ object AutoDjEngine {
         disliked: Set<String>,
         avoid: Set<String> = emptySet(),
         seedTags: Set<String> = emptySet(),
-        mode: FlowMode = FlowMode.BALANCED
-    ): Track? = rank(current, candidates, history, liked, disliked, avoid, seedTags, mode).firstOrNull()?.track
+        mode: FlowMode = FlowMode.BALANCED,
+        skipCounts: Map<String, Int> = emptyMap(),
+        listenedCounts: Map<String, Int> = emptyMap()
+    ): Track? = rank(current, candidates, history, liked, disliked, avoid, seedTags, mode, skipCounts, listenedCounts).firstOrNull()?.track
 }
